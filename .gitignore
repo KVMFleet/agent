@@ -1,0 +1,5 @@
+eurokvm-agent
+eurokvm-agent.*
+*.token
+state.json
+.DS_Store
