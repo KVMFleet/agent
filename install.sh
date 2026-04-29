@@ -1,11 +1,11 @@
 #!/bin/sh
-# EuroKVM Fleet — Universal agent installer
+# KVM Fleet — Universal agent installer
 #
 # Usage:
-#   curl -sSL https://install.eurokvm.io/agent | sh -s -- --token <enrollment-token>
+#   curl -sSL https://install.kvmfleet.io/agent | sh -s -- --token <enrollment-token>
 #
 # Or with env var:
-#   EUROKVM_TOKEN=ekvent_xxx curl -sSL https://install.eurokvm.io/agent | sh
+#   EUROKVM_TOKEN=ekvent_xxx curl -sSL https://install.kvmfleet.io/agent | sh
 #
 # Supports:
 #   - JetKVM  (BusyBox Linux, armv7l, /etc/init.d/)
@@ -16,7 +16,7 @@
 # agent is already registered (state file exists).
 set -eu
 
-PLATFORM_URL="${EUROKVM_API:-https://app.eurokvm.io}"
+PLATFORM_URL="${EUROKVM_API:-https://app.kvmfleet.io}"
 DOWNLOAD_BASE="${EUROKVM_DOWNLOAD_URL:-${PLATFORM_URL}/downloads}"
 VERSION="${EUROKVM_AGENT_VERSION:-latest}"
 
@@ -33,13 +33,13 @@ while [ $# -gt 0 ]; do
         --tags)    DEVICE_TAGS="$2"; shift 2 ;;
         --api)     PLATFORM_URL="$2"; shift 2 ;;
         --help|-h)
-            echo "Usage: curl -sSL https://install.eurokvm.io/agent | sh -s -- --token <token>"
+            echo "Usage: curl -sSL https://install.kvmfleet.io/agent | sh -s -- --token <token>"
             echo ""
             echo "Options:"
             echo "  --token <token>   Enrollment token (required, or set EUROKVM_TOKEN)"
             echo "  --name <name>     Device name (optional)"
             echo "  --tags <t1,t2>    Comma-separated tags (optional)"
-            echo "  --api <url>       Platform URL (default: https://app.eurokvm.io)"
+            echo "  --api <url>       Platform URL (default: https://app.kvmfleet.io)"
             exit 0 ;;
         *) echo "unknown arg: $1"; exit 1 ;;
     esac
@@ -84,7 +84,7 @@ detect_device_type() {
 INIT_SYSTEM=$(detect_init_system)
 DEVICE_TYPE=$(detect_device_type)
 
-echo "=== EuroKVM Agent Installer ==="
+echo "=== KVM Fleet Agent Installer ==="
 echo "  Platform:    $PLATFORM_URL"
 echo "  Arch:        $ARCH → $BINARY_ARCH"
 echo "  Init system: $INIT_SYSTEM"
@@ -181,7 +181,7 @@ case "$INIT_SYSTEM" in
     systemd)
         cat > /etc/systemd/system/eurokvm-agent.service <<UNIT
 [Unit]
-Description=EuroKVM Fleet Agent
+Description=KVM Fleet Agent
 After=network-online.target
 Wants=network-online.target
 
@@ -211,7 +211,7 @@ UNIT
         INIT_SCRIPT="$INSTALL_DIR/init.sh"
         cat > "$INIT_SCRIPT" <<INITSCRIPT
 #!/bin/sh
-# EuroKVM agent init script for BusyBox
+# KVM Fleet agent init script for BusyBox
 PIDFILE="/var/run/eurokvm-agent.pid"
 AGENT="$AGENT_BIN"
 

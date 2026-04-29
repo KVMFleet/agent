@@ -22,6 +22,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -62,11 +63,15 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 		if err != nil {
 			log.Fatalf("bad --kvmd-url: %v", err)
 		}
+		kvmdBasicAuth := "Basic " + base64.StdEncoding.EncodeToString(
+			[]byte(cfg.KvmdUser+":"+cfg.KvmdPass),
+		)
 		proxy := &httputil.ReverseProxy{
 			Director: func(r *http.Request) {
 				r.URL.Scheme = target.Scheme
 				r.URL.Host = target.Host
 				r.Host = target.Host
+				r.Header.Set("Authorization", kvmdBasicAuth)
 			},
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -116,6 +121,8 @@ type config struct {
 	ConsoleAddr string // bind addr for standalone HTTP server (":8080")
 	ConsoleHost string // hostname the platform would use for direct routing
 	KvmdURL     string // upstream kvmd (e.g. "https://127.0.0.1/"); empty = fake HTML
+	KvmdUser    string // kvmd Basic auth username (default: admin)
+	KvmdPass    string // kvmd Basic auth password (default: admin)
 }
 
 type state struct {
@@ -246,6 +253,8 @@ func loadConfig() config {
 	consoleAddr := flag.String("console-addr", envOr("EUROKVM_CONSOLE_ADDR", ":8080"), "embedded fake-PiKVM HTTP bind address")
 	consoleHost := flag.String("console-host", envOr("EUROKVM_CONSOLE_HOST", ""), "hostname platform uses to reach us (defaults to hostname)")
 	kvmdURL := flag.String("kvmd-url", envOr("EUROKVM_KVMD_URL", ""), "upstream kvmd URL (e.g. https://127.0.0.1/); empty = fake HTML mode")
+	kvmdUser := flag.String("kvmd-user", envOr("EUROKVM_KVMD_USER", "admin"), "kvmd Basic auth username")
+	kvmdPass := flag.String("kvmd-pass", envOr("EUROKVM_KVMD_PASS", "admin"), "kvmd Basic auth password")
 	flag.Parse()
 
 	id := *hwID
@@ -287,6 +296,8 @@ func loadConfig() config {
 		ConsoleAddr: *consoleAddr,
 		ConsoleHost: host,
 		KvmdURL:     kurl,
+		KvmdUser:    *kvmdUser,
+		KvmdPass:    *kvmdPass,
 	}
 }
 
@@ -483,11 +494,15 @@ func connect(ctx context.Context, cfg config, st *state) error {
 			}
 			switch msg["type"] {
 			case "http.request":
-				// Dispatch off the read loop so a slow handler cannot stall
-				// heartbeat reception.
 				go handleHTTPRequest(connCtx, writes, msg)
+			case "ws.open":
+				go handleWSOpen(connCtx, writes, msg, cfg)
+			case "ws.frame":
+				handleWSFrame(msg)
+			case "ws.close":
+				handleWSClose(msg)
 			default:
-				// ignore unknown frames (platform→agent control surface may grow)
+				// ignore unknown frames
 			}
 		}
 	}()
@@ -594,6 +609,214 @@ func handleHTTPRequest(ctx context.Context, writes chan<- []byte, msg map[string
 	case <-ctx.Done():
 	case <-time.After(10 * time.Second):
 		log.Printf("dropped http.response for %s (write queue full)", reqID)
+	}
+}
+
+// --- WebSocket channel tunneling ---
+//
+// The platform can ask us to open a local WebSocket to kvmd and relay
+// frames bidirectionally. This is how the browser gets live video and
+// keyboard/mouse from PiKVM through the tunnel.
+
+var (
+	wsChannels   = make(map[string]*wsChannel)
+	wsChannelsMu sync.Mutex
+)
+
+type wsChannel struct {
+	conn   *websocket.Conn
+	cancel context.CancelFunc
+}
+
+func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any, cfg config) {
+	channelID, _ := msg["channel"].(string)
+	path, _ := msg["path"].(string)
+	if channelID == "" || path == "" {
+		return
+	}
+
+	// Route to the right local service.
+	// Janus has a Unix socket at /run/kvmd/janus-ws.sock — connect directly
+	// to bypass nginx auth issues. Everything else goes through nginx (kvmd URL).
+	var useUnixSocket string
+	cleanPath := path
+	if strings.HasPrefix(path, "/janus/") || strings.HasPrefix(path, "janus/") {
+		useUnixSocket = "/run/kvmd/janus-ws.sock"
+		// Janus expects / not /janus/ws — strip the prefix
+		cleanPath = strings.TrimPrefix(path, "/janus")
+		cleanPath = strings.TrimPrefix(cleanPath, "janus")
+		if cleanPath == "" || cleanPath == "/ws" {
+			cleanPath = "/"
+		}
+	}
+
+	var u *url.URL
+	if useUnixSocket != "" {
+		// For Unix socket, we'll use a custom dialer — URL is just for the path
+		u = &url.URL{Scheme: "ws", Host: "localhost", Path: cleanPath}
+	} else {
+		kvmdBase := cfg.KvmdURL
+		if kvmdBase == "" {
+			kvmdBase = "http://127.0.0.1:80"
+		}
+		var err error
+		u, err = url.Parse(kvmdBase)
+		if err != nil {
+			log.Printf("ws.open: bad URL: %v", err)
+			sendWSClose(writes, channelID)
+			return
+		}
+		if u.Scheme == "https" {
+			u.Scheme = "wss"
+		} else if u.Scheme == "http" {
+			u.Scheme = "ws"
+		}
+		u.Path = path
+	}
+	if qi := strings.IndexByte(u.Path, '?'); qi >= 0 {
+		u.RawQuery = u.Path[qi+1:]
+		u.Path = u.Path[:qi]
+	}
+
+	dialCtx, cancel := context.WithCancel(ctx)
+
+	kvmdAuth := "Basic " + base64.StdEncoding.EncodeToString(
+		[]byte(cfg.KvmdUser+":"+cfg.KvmdPass),
+	)
+	opts := &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Authorization": {kvmdAuth},
+		},
+	}
+
+	if useUnixSocket != "" {
+		// Connect directly to Unix socket (bypasses nginx auth)
+		opts.HTTPClient = &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return net.Dial("unix", useUnixSocket)
+				},
+			},
+		}
+		opts.HTTPHeader = http.Header{} // no auth needed for Unix socket
+		opts.Subprotocols = []string{"janus-protocol"}
+	} else if u.Scheme == "wss" {
+		// Skip TLS verify for self-signed kvmd certs
+		opts.HTTPClient = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+	}
+
+	c, _, err := websocket.Dial(dialCtx, u.String(), opts)
+	if err != nil {
+		log.Printf("ws.open: failed to connect to %s: %v", u.String(), err)
+		cancel()
+		sendWSClose(writes, channelID)
+		return
+	}
+	// Increase read limit for video frames
+	c.SetReadLimit(4 * 1024 * 1024) // 4 MB
+
+	ch := &wsChannel{conn: c, cancel: cancel}
+	wsChannelsMu.Lock()
+	wsChannels[channelID] = ch
+	wsChannelsMu.Unlock()
+
+	// Notify platform that channel is open
+	opened, _ := json.Marshal(map[string]any{"type": "ws.opened", "channel": channelID})
+	select {
+	case writes <- opened:
+	case <-ctx.Done():
+		c.Close(websocket.StatusGoingAway, "")
+		return
+	}
+
+	log.Printf("ws channel %s opened → %s", channelID[:8], u.String())
+
+	// Read loop: kvmd → platform (→ browser)
+	go func() {
+		defer func() {
+			c.Close(websocket.StatusNormalClosure, "")
+			cancel()
+			wsChannelsMu.Lock()
+			delete(wsChannels, channelID)
+			wsChannelsMu.Unlock()
+			sendWSClose(writes, channelID)
+			log.Printf("ws channel %s closed", channelID[:8])
+		}()
+
+		for {
+			typ, data, err := c.Read(dialCtx)
+			if err != nil {
+				return
+			}
+
+			frame := map[string]any{
+				"type":    "ws.frame",
+				"channel": channelID,
+			}
+			if typ == websocket.MessageBinary {
+				frame["binary"] = true
+				frame["data_b64"] = base64.StdEncoding.EncodeToString(data)
+			} else {
+				frame["binary"] = false
+				frame["data"] = string(data)
+			}
+
+			b, _ := json.Marshal(frame)
+			select {
+			case writes <- b:
+			case <-dialCtx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				return // write queue full, close channel
+			}
+		}
+	}()
+}
+
+func handleWSFrame(msg map[string]any) {
+	channelID, _ := msg["channel"].(string)
+	wsChannelsMu.Lock()
+	ch := wsChannels[channelID]
+	wsChannelsMu.Unlock()
+	if ch == nil {
+		return
+	}
+
+	isBinary, _ := msg["binary"].(bool)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if isBinary {
+		dataB64, _ := msg["data_b64"].(string)
+		data, _ := base64.StdEncoding.DecodeString(dataB64)
+		ch.conn.Write(ctx, websocket.MessageBinary, data)
+	} else {
+		data, _ := msg["data"].(string)
+		ch.conn.Write(ctx, websocket.MessageText, []byte(data))
+	}
+}
+
+func handleWSClose(msg map[string]any) {
+	channelID, _ := msg["channel"].(string)
+	wsChannelsMu.Lock()
+	ch := wsChannels[channelID]
+	delete(wsChannels, channelID)
+	wsChannelsMu.Unlock()
+	if ch != nil {
+		ch.conn.Close(websocket.StatusNormalClosure, "")
+		ch.cancel()
+	}
+}
+
+func sendWSClose(writes chan<- []byte, channelID string) {
+	frame, _ := json.Marshal(map[string]any{"type": "ws.close", "channel": channelID})
+	select {
+	case writes <- frame:
+	default:
 	}
 }
 
