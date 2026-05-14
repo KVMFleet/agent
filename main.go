@@ -1,4 +1,4 @@
-// EuroKVM device agent.
+// KVM Fleet device agent.
 //
 // MVP responsibilities:
 //   1. On first start, exchange an enrollment token for a per-device auth token.
@@ -42,8 +42,9 @@ import (
 // (startConsoleServer) and the HTTP-over-WS multiplex path. It must be set up
 // before connect() starts so incoming http.request frames can be dispatched.
 var (
-	agentMux     *http.ServeMux
-	agentMuxOnce sync.Once
+	agentMux        *http.ServeMux
+	agentMuxOnce    sync.Once
+	agentKvmdCookies []*http.Cookie // session cookies from kvmd login
 )
 
 func buildAgentMux(cfg config, st *state) *http.ServeMux {
@@ -58,7 +59,6 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 
 	if cfg.KvmdURL != "" {
 		// Real mode: reverse-proxy every request to the local kvmd web UI.
-		// kvmd uses a self-signed cert, so we skip TLS verification.
 		target, err := url.Parse(cfg.KvmdURL)
 		if err != nil {
 			log.Fatalf("bad --kvmd-url: %v", err)
@@ -66,20 +66,95 @@ func buildAgentMux(cfg config, st *state) *http.ServeMux {
 		kvmdBasicAuth := "Basic " + base64.StdEncoding.EncodeToString(
 			[]byte(cfg.KvmdUser+":"+cfg.KvmdPass),
 		)
+		tlsTransport := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+
+		// Login to kvmd to get a session cookie. This is needed for endpoints
+		// like ttyd's /token which don't accept Basic auth directly.
+		var kvmdCookies []*http.Cookie
+		loginURL := cfg.KvmdURL + "/api/auth/login"
+		loginBody := fmt.Sprintf("user=%s&passwd=%s", cfg.KvmdUser, cfg.KvmdPass)
+		loginReq, _ := http.NewRequest("POST", loginURL, strings.NewReader(loginBody))
+		loginReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		loginClient := &http.Client{Transport: tlsTransport}
+		if resp, err := loginClient.Do(loginReq); err == nil {
+			kvmdCookies = resp.Cookies()
+			agentKvmdCookies = kvmdCookies // store at package level for WS connections
+			resp.Body.Close()
+			if len(kvmdCookies) > 0 {
+				log.Printf("kvmd auth: got %d session cookie(s)", len(kvmdCookies))
+			} else {
+				log.Printf("kvmd auth: login OK (HTTP %d) but no cookies returned", resp.StatusCode)
+			}
+		} else {
+			log.Printf("kvmd auth: login failed: %v (falling back to Basic auth)", err)
+		}
+
 		proxy := &httputil.ReverseProxy{
 			Director: func(r *http.Request) {
 				r.URL.Scheme = target.Scheme
 				r.URL.Host = target.Host
 				r.Host = target.Host
 				r.Header.Set("Authorization", kvmdBasicAuth)
+				// Add session cookies for endpoints that need them (e.g. ttyd)
+				for _, c := range kvmdCookies {
+					r.AddCookie(c)
+				}
 			},
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+			Transport: tlsTransport,
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 				http.Error(w, fmt.Sprintf("kvmd unreachable: %v", err), http.StatusBadGateway)
 			},
 		}
+
+		// Route ttyd requests directly to its Unix socket, bypassing nginx.
+		// PiKVM's nginx adds a trailing slash via rewrite rules which breaks
+		// ttyd's /token endpoint (it only serves /token, not /token/).
+		const ttydSock = "/run/kvmd/ttyd.sock"
+		if _, err := os.Stat(ttydSock); err == nil {
+			ttydTransport := &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return net.Dial("unix", ttydSock)
+				},
+			}
+			ttydProxy := &httputil.ReverseProxy{
+				Director: func(r *http.Request) {
+					r.URL.Scheme = "http"
+					r.URL.Host = "localhost"
+					// Strip the /extras/webterm/ttyd prefix — ttyd expects /
+					p := strings.TrimPrefix(r.URL.Path, "/extras/webterm/ttyd")
+					if p == "" {
+						p = "/"
+					}
+					// Strip trailing slash — ttyd serves /token not /token/
+					if p != "/" && strings.HasSuffix(p, "/") {
+						p = strings.TrimRight(p, "/")
+					}
+					r.URL.Path = p
+					r.Host = "localhost"
+				},
+				Transport: ttydTransport,
+			}
+			mux.Handle("/extras/webterm/ttyd/", ttydProxy)
+			mux.Handle("/extras/webterm/ttyd", ttydProxy)
+			log.Printf("ttyd: direct Unix socket route → %s", ttydSock)
+		}
+
+		// /internal/iso/{mount,unmount} — ISO library handlers. Platform
+		// posts a JSON {name, source_url, sha256, size_bytes, media_type};
+		// agent downloads from source_url, verifies sha256, multipart-uploads
+		// to kvmd's /api/msd/write, and calls /api/msd/connect.
+		mux.HandleFunc("/internal/iso/mount", makeIsoMountHandler(cfg, kvmdBasicAuth, kvmdCookies, tlsTransport))
+		mux.HandleFunc("/internal/iso/unmount", makeIsoUnmountHandler(cfg, kvmdBasicAuth, kvmdCookies, tlsTransport))
+
+		// /internal/webrtc/offer — pion-based PeerConnection for the
+		// preview WebRTC console. Browser sends SDP offer through the
+		// platform tunnel; we negotiate a peer connection with a HID
+		// data channel that forwards events to kvmd's /api/hid/* API.
+		// Video track + kvmd source is a follow-up phase.
+		mux.HandleFunc("/internal/webrtc/offer", makeWebrtcOfferHandler(cfg, kvmdBasicAuth, kvmdCookies, tlsTransport))
+
 		mux.Handle("/", proxy)
 		log.Printf("console mode: kvmd reverse-proxy → %s", cfg.KvmdURL)
 	} else {
@@ -142,7 +217,7 @@ func main() {
 	case "run":
 		runAgent()
 	case "version":
-		fmt.Println("eurokvm-agent", version)
+		fmt.Println("kvmfleet-agent", version)
 	default:
 		log.Fatalf("unknown command: %s", cmd)
 	}
@@ -150,7 +225,8 @@ func main() {
 
 func runAgent() {
 	cfg := loadConfig()
-	if err := os.MkdirAll(filepath.Dir(cfg.StatePath), 0o755); err != nil {
+	requireSafeKvmdPassword(cfg)
+	if err := os.MkdirAll(filepath.Dir(cfg.StatePath), 0o700); err != nil {
 		log.Fatalf("mkdir state dir: %v", err)
 	}
 
@@ -186,7 +262,7 @@ func runAgent() {
 // for platform→agent HTTP traffic is the http.request frame handled over the
 // outbound WS in connect(). This local server is kept only for native dev
 // (curl http://localhost:8080/) and for the docker-compose direct-routing
-// fallback; you can disable it by setting EUROKVM_CONSOLE_ADDR=off.
+// fallback; you can disable it by setting KVMFLEET_CONSOLE_ADDR=off.
 func startConsoleServer(ctx context.Context, cfg config, st *state) {
 	if cfg.ConsoleAddr == "off" || cfg.ConsoleAddr == "" {
 		return
@@ -242,19 +318,25 @@ const fakeConsoleHTML = `<!doctype html>
 `
 
 func loadConfig() config {
-	api := flag.String("api", envOr("EUROKVM_API", "http://localhost:8000"), "platform base URL")
-	statePath := flag.String("state", envOr("EUROKVM_STATE", "/var/lib/eurokvm/state.json"), "state file path")
-	tokenFile := flag.String("token-file", os.Getenv("EUROKVM_TOKEN_FILE"), "file containing enrollment token (single use)")
-	name := flag.String("name", os.Getenv("EUROKVM_DEVICE_NAME"), "suggested device name")
-	tags := flag.String("tags", os.Getenv("EUROKVM_DEVICE_TAGS"), "comma-separated tags")
-	hwKind := flag.String("hw-kind", envOr("EUROKVM_HW_KIND", "pikvm-v4"), "hardware kind")
-	hwID := flag.String("hw-id", os.Getenv("EUROKVM_HW_ID"), "stable hardware id (defaults to hostname)")
+	api := flag.String("api", envOr("KVMFLEET_API", "http://localhost:8000"), "platform base URL")
+	statePath := flag.String("state", envOr("KVMFLEET_STATE", "/var/lib/kvmfleet/state.json"), "state file path")
+	tokenFile := flag.String("token-file", os.Getenv("KVMFLEET_TOKEN_FILE"), "file containing enrollment token (single use)")
+	name := flag.String("name", os.Getenv("KVMFLEET_DEVICE_NAME"), "suggested device name")
+	tags := flag.String("tags", os.Getenv("KVMFLEET_DEVICE_TAGS"), "comma-separated tags")
+	hwKind := flag.String("hw-kind", envOr("KVMFLEET_HW_KIND", "pikvm-v4"), "hardware kind")
+	hwID := flag.String("hw-id", os.Getenv("KVMFLEET_HW_ID"), "stable hardware id (defaults to hostname)")
 	simulate := flag.Bool("simulate", true, "simulate metrics rather than read hardware")
-	consoleAddr := flag.String("console-addr", envOr("EUROKVM_CONSOLE_ADDR", ":8080"), "embedded fake-PiKVM HTTP bind address")
-	consoleHost := flag.String("console-host", envOr("EUROKVM_CONSOLE_HOST", ""), "hostname platform uses to reach us (defaults to hostname)")
-	kvmdURL := flag.String("kvmd-url", envOr("EUROKVM_KVMD_URL", ""), "upstream kvmd URL (e.g. https://127.0.0.1/); empty = fake HTML mode")
-	kvmdUser := flag.String("kvmd-user", envOr("EUROKVM_KVMD_USER", "admin"), "kvmd Basic auth username")
-	kvmdPass := flag.String("kvmd-pass", envOr("EUROKVM_KVMD_PASS", "admin"), "kvmd Basic auth password")
+	// Default to loopback-only so a stray default-config install doesn't
+	// expose kvmd to the LAN unauthenticated. Set KVMFLEET_CONSOLE_ADDR=off
+	// in production (recommended), or override to a specific address only
+	// when you understand the implications.
+	consoleAddr := flag.String("console-addr", envOr("KVMFLEET_CONSOLE_ADDR", "127.0.0.1:8080"), "embedded fake-PiKVM HTTP bind address (loopback by default)")
+	consoleHost := flag.String("console-host", envOr("KVMFLEET_CONSOLE_HOST", ""), "hostname platform uses to reach us (defaults to hostname)")
+	kvmdURL := flag.String("kvmd-url", envOr("KVMFLEET_KVMD_URL", ""), "upstream kvmd URL (e.g. https://127.0.0.1/); empty = fake HTML mode")
+	kvmdUser := flag.String("kvmd-user", envOr("KVMFLEET_KVMD_USER", "admin"), "kvmd Basic auth username")
+	// kvmd-pass is read from env only — NEVER from a flag, since flags are
+	// visible in `ps -ef` to anyone on the box.
+	kvmdPass := os.Getenv("KVMFLEET_KVMD_PASS")
 	flag.Parse()
 
 	id := *hwID
@@ -297,7 +379,31 @@ func loadConfig() config {
 		ConsoleHost: host,
 		KvmdURL:     kurl,
 		KvmdUser:    *kvmdUser,
-		KvmdPass:    *kvmdPass,
+		KvmdPass:    kvmdPass,
+	}
+}
+
+// requireSafeKvmdPassword aborts startup if the operator left the kvmd
+// password at the well-known PiKVM default. Anyone on the LAN with a
+// default-installed PiKVM can otherwise log in as admin trivially, and
+// this agent would happily proxy that.
+func requireSafeKvmdPassword(cfg config) {
+	if cfg.KvmdURL == "" {
+		// Simulate mode: no real kvmd to talk to.
+		return
+	}
+	if os.Getenv("KVMFLEET_ALLOW_DEFAULT_KVMD_PASS") == "1" {
+		log.Printf("WARNING: KVMFLEET_ALLOW_DEFAULT_KVMD_PASS=1 — running with default kvmd credentials")
+		return
+	}
+	if cfg.KvmdPass == "" {
+		log.Fatalf("KVMFLEET_KVMD_PASS not set; refusing to start. " +
+			"Set it to your kvmd password (default 'admin' is rejected for safety).")
+	}
+	if cfg.KvmdUser == "admin" && cfg.KvmdPass == "admin" {
+		log.Fatalf("KVMFLEET_KVMD_PASS is the PiKVM default 'admin'; refusing to start. " +
+			"Change your kvmd password (kvmd-htpasswd set admin) and set KVMFLEET_KVMD_PASS to it. " +
+			"To override (NOT recommended), set KVMFLEET_ALLOW_DEFAULT_KVMD_PASS=1.")
 	}
 }
 
@@ -341,7 +447,7 @@ func saveState(path string, s *state) error {
 
 func enroll(cfg config) (*state, error) {
 	if cfg.TokenFile == "" {
-		return nil, fmt.Errorf("no enrollment token (set EUROKVM_TOKEN_FILE or --token-file)")
+		return nil, fmt.Errorf("no enrollment token (set KVMFLEET_TOKEN_FILE or --token-file)")
 	}
 	// poll for token file (seed script may not have run yet)
 	var tokenBytes []byte
@@ -577,6 +683,9 @@ func handleHTTPRequest(ctx context.Context, writes chan<- []byte, msg map[string
 			}
 		}
 	}
+	// Request uncompressed responses — the platform needs to rewrite URLs
+	// in the response body, which doesn't work on gzipped content.
+	req.Header.Set("Accept-Encoding", "identity")
 
 	rec := httptest.NewRecorder()
 	// Defensive: if mux isn't ready (shouldn't happen post-init), return 503.
@@ -636,17 +745,34 @@ func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any,
 	}
 
 	// Route to the right local service.
-	// Janus has a Unix socket at /run/kvmd/janus-ws.sock — connect directly
-	// to bypass nginx auth issues. Everything else goes through nginx (kvmd URL).
+	// Some KVM devices (PiKVM) have services on Unix sockets that are
+	// inaccessible through their nginx auth layer. We detect known sockets
+	// and connect directly when they exist.
+	type socketRoute struct {
+		pathPrefix string
+		socketPath string
+		stripTo    string
+		subproto   string
+	}
+	knownSockets := []socketRoute{
+		{"/janus/", "/run/kvmd/janus-ws.sock", "/", "janus-protocol"},
+		{"janus/", "/run/kvmd/janus-ws.sock", "/", "janus-protocol"},
+		{"/extras/webterm/ttyd/ws", "/run/kvmd/ttyd.sock", "/ws", "tty"},
+		{"extras/webterm/ttyd/ws", "/run/kvmd/ttyd.sock", "/ws", "tty"},
+	}
+
 	var useUnixSocket string
+	var socketSubproto string
 	cleanPath := path
-	if strings.HasPrefix(path, "/janus/") || strings.HasPrefix(path, "janus/") {
-		useUnixSocket = "/run/kvmd/janus-ws.sock"
-		// Janus expects / not /janus/ws — strip the prefix
-		cleanPath = strings.TrimPrefix(path, "/janus")
-		cleanPath = strings.TrimPrefix(cleanPath, "janus")
-		if cleanPath == "" || cleanPath == "/ws" {
-			cleanPath = "/"
+	for _, sr := range knownSockets {
+		if strings.HasPrefix(path, sr.pathPrefix) {
+			// Only use Unix socket if it actually exists on this device
+			if _, err := os.Stat(sr.socketPath); err == nil {
+				useUnixSocket = sr.socketPath
+				socketSubproto = sr.subproto
+				cleanPath = sr.stripTo
+				break
+			}
 		}
 	}
 
@@ -683,10 +809,22 @@ func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any,
 	kvmdAuth := "Basic " + base64.StdEncoding.EncodeToString(
 		[]byte(cfg.KvmdUser+":"+cfg.KvmdPass),
 	)
+	// Build cookie header from session cookies
+	var cookieStr string
+	for _, c := range agentKvmdCookies {
+		if cookieStr != "" {
+			cookieStr += "; "
+		}
+		cookieStr += c.Name + "=" + c.Value
+	}
+	wsHeaders := http.Header{
+		"Authorization": {kvmdAuth},
+	}
+	if cookieStr != "" {
+		wsHeaders.Set("Cookie", cookieStr)
+	}
 	opts := &websocket.DialOptions{
-		HTTPHeader: http.Header{
-			"Authorization": {kvmdAuth},
-		},
+		HTTPHeader: wsHeaders,
 	}
 
 	if useUnixSocket != "" {
@@ -699,7 +837,9 @@ func handleWSOpen(ctx context.Context, writes chan<- []byte, msg map[string]any,
 			},
 		}
 		opts.HTTPHeader = http.Header{} // no auth needed for Unix socket
-		opts.Subprotocols = []string{"janus-protocol"}
+		if socketSubproto != "" {
+			opts.Subprotocols = []string{socketSubproto}
+		}
 	} else if u.Scheme == "wss" {
 		// Skip TLS verify for self-signed kvmd certs
 		opts.HTTPClient = &http.Client{

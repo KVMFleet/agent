@@ -5,7 +5,7 @@
 #   curl -sSL https://install.kvmfleet.io/agent | sh -s -- --token <enrollment-token>
 #
 # Or with env var:
-#   EUROKVM_TOKEN=ekvent_xxx curl -sSL https://install.kvmfleet.io/agent | sh
+#   KVMFLEET_TOKEN=ekvent_xxx curl -sSL https://install.kvmfleet.io/agent | sh
 #
 # Supports:
 #   - JetKVM  (BusyBox Linux, armv7l, /etc/init.d/)
@@ -16,30 +16,36 @@
 # agent is already registered (state file exists).
 set -eu
 
-PLATFORM_URL="${EUROKVM_API:-https://app.kvmfleet.io}"
-DOWNLOAD_BASE="${EUROKVM_DOWNLOAD_URL:-${PLATFORM_URL}/downloads}"
-VERSION="${EUROKVM_AGENT_VERSION:-latest}"
+PLATFORM_URL="${KVMFLEET_API:-https://app.kvmfleet.io}"
+DOWNLOAD_BASE="${KVMFLEET_DOWNLOAD_URL:-${PLATFORM_URL}/downloads}"
+VERSION="${KVMFLEET_AGENT_VERSION:-latest}"
 
 # --- Parse args -----------------------------------------------------------
 
-TOKEN="${EUROKVM_TOKEN:-}"
-DEVICE_NAME="${EUROKVM_DEVICE_NAME:-}"
-DEVICE_TAGS="${EUROKVM_DEVICE_TAGS:-}"
+TOKEN="${KVMFLEET_TOKEN:-}"
+DEVICE_NAME="${KVMFLEET_DEVICE_NAME:-}"
+DEVICE_TAGS="${KVMFLEET_DEVICE_TAGS:-}"
+KVMD_USER="${KVMFLEET_KVMD_USER:-admin}"
+KVMD_PASS="${KVMFLEET_KVMD_PASS:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --token)   TOKEN="$2";       shift 2 ;;
-        --name)    DEVICE_NAME="$2"; shift 2 ;;
-        --tags)    DEVICE_TAGS="$2"; shift 2 ;;
-        --api)     PLATFORM_URL="$2"; shift 2 ;;
+        --token)     TOKEN="$2";       shift 2 ;;
+        --name)      DEVICE_NAME="$2"; shift 2 ;;
+        --tags)      DEVICE_TAGS="$2"; shift 2 ;;
+        --api)       PLATFORM_URL="$2"; shift 2 ;;
+        --kvmd-user) KVMD_USER="$2";   shift 2 ;;
+        --kvmd-pass) KVMD_PASS="$2";   shift 2 ;;
         --help|-h)
-            echo "Usage: curl -sSL https://install.kvmfleet.io/agent | sh -s -- --token <token>"
+            echo "Usage: curl -sSL https://app.kvmfleet.io/install | sh -s -- --token <token> --kvmd-pass <pass>"
             echo ""
             echo "Options:"
-            echo "  --token <token>   Enrollment token (required, or set EUROKVM_TOKEN)"
-            echo "  --name <name>     Device name (optional)"
-            echo "  --tags <t1,t2>    Comma-separated tags (optional)"
-            echo "  --api <url>       Platform URL (default: https://app.kvmfleet.io)"
+            echo "  --token <token>      Enrollment token (required, or set KVMFLEET_TOKEN)"
+            echo "  --name <name>        Device name (optional)"
+            echo "  --tags <t1,t2>       Comma-separated tags (optional)"
+            echo "  --api <url>          Platform URL (default: https://app.kvmfleet.io)"
+            echo "  --kvmd-user <user>   Local kvmd username (default: admin)"
+            echo "  --kvmd-pass <pass>   Local kvmd password (required for PiKVM, or set KVMFLEET_KVMD_PASS)"
             exit 0 ;;
         *) echo "unknown arg: $1"; exit 1 ;;
     esac
@@ -47,7 +53,7 @@ done
 
 if [ -z "$TOKEN" ]; then
     echo "ERROR: enrollment token required."
-    echo "  --token <token>  or  EUROKVM_TOKEN=<token>"
+    echo "  --token <token>  or  KVMFLEET_TOKEN=<token>"
     exit 1
 fi
 
@@ -95,20 +101,20 @@ echo ""
 
 case "$DEVICE_TYPE" in
     jetkvm)
-        INSTALL_DIR="/userdata/eurokvm"
+        INSTALL_DIR="/userdata/kvmfleet"
         AGENT_BIN="$INSTALL_DIR/agent"
         STATE_FILE="$INSTALL_DIR/state.json"
         TOKEN_FILE="$INSTALL_DIR/enrollment.token"
         ;;
     pikvm)
-        INSTALL_DIR="/var/lib/eurokvm"
-        AGENT_BIN="/usr/local/bin/eurokvm-agent"
+        INSTALL_DIR="/var/lib/kvmfleet"
+        AGENT_BIN="/usr/local/bin/kvmfleet-agent"
         STATE_FILE="$INSTALL_DIR/state.json"
         TOKEN_FILE="$INSTALL_DIR/enrollment.token"
         ;;
     *)
-        INSTALL_DIR="/var/lib/eurokvm"
-        AGENT_BIN="/usr/local/bin/eurokvm-agent"
+        INSTALL_DIR="/var/lib/kvmfleet"
+        AGENT_BIN="/usr/local/bin/kvmfleet-agent"
         STATE_FILE="$INSTALL_DIR/state.json"
         TOKEN_FILE="$INSTALL_DIR/enrollment.token"
         ;;
@@ -121,7 +127,7 @@ if [ -f "$STATE_FILE" ]; then
     echo "To re-enroll, remove $STATE_FILE and run again."
     echo "Ensuring service is running..."
     case "$INIT_SYSTEM" in
-        systemd)  systemctl start eurokvm-agent 2>/dev/null || true ;;
+        systemd)  systemctl start kvmfleet-agent 2>/dev/null || true ;;
         busybox)  "$INSTALL_DIR/init.sh" start 2>/dev/null || true ;;
     esac
     exit 0
@@ -141,7 +147,7 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 
-DOWNLOAD_URL="${DOWNLOAD_BASE}/eurokvm-agent.linux-${BINARY_ARCH}"
+DOWNLOAD_URL="${DOWNLOAD_BASE}/kvmfleet-agent.linux-${BINARY_ARCH}"
 echo "Downloading agent from $DOWNLOAD_URL ..."
 
 if command -v curl >/dev/null 2>&1; then
@@ -175,11 +181,46 @@ case "$DEVICE_TYPE" in
     pikvm)   KVMD_URL="https://127.0.0.1" ;;
 esac
 
+# kvmd password is required on devices that proxy through a local kvmd
+# (PiKVM, JetKVM). Generic Linux installs without kvmd skip this.
+case "$DEVICE_TYPE" in
+    pikvm|jetkvm)
+        if [ -z "$KVMD_PASS" ]; then
+            echo "ERROR: this device proxies through a local kvmd that requires a password."
+            echo "Either:"
+            echo "  1. Pass it on the command line:"
+            echo "       curl -sSL https://app.kvmfleet.io/install | sh -s -- \\"
+            echo "         --token $TOKEN --kvmd-pass <your-kvmd-password>"
+            echo "  2. Or set the env var before piping:"
+            echo "       KVMFLEET_TOKEN=... KVMFLEET_KVMD_PASS=<pass> \\"
+            echo "         curl -sSL https://app.kvmfleet.io/install | sh"
+            echo ""
+            echo "If you haven't set a kvmd password yet, run on the device:"
+            echo "       kvmd-htpasswd set admin"
+            echo "(the default 'admin' password is rejected by the agent for safety)."
+            exit 1
+        fi
+        ;;
+esac
+
+# Persist kvmd credentials to a 0600-mode env file separate from the unit
+# file so they aren't world-readable in /etc/systemd/system/.
+KVMD_ENV_DIR="/etc/kvmfleet"
+KVMD_ENV_FILE="$KVMD_ENV_DIR/agent.env"
+if [ -n "$KVMD_PASS" ]; then
+    mkdir -p "$KVMD_ENV_DIR"
+    cat > "$KVMD_ENV_FILE" <<KVMDENV
+KVMFLEET_KVMD_USER=$KVMD_USER
+KVMFLEET_KVMD_PASS=$KVMD_PASS
+KVMDENV
+    chmod 600 "$KVMD_ENV_FILE"
+fi
+
 # --- Set up service ---------------------------------------------------------
 
 case "$INIT_SYSTEM" in
     systemd)
-        cat > /etc/systemd/system/eurokvm-agent.service <<UNIT
+        cat > /etc/systemd/system/kvmfleet-agent.service <<UNIT
 [Unit]
 Description=KVM Fleet Agent
 After=network-online.target
@@ -190,21 +231,22 @@ Type=simple
 ExecStart=$AGENT_BIN run
 Restart=always
 RestartSec=5
-Environment=EUROKVM_API=$PLATFORM_URL
-Environment=EUROKVM_TOKEN_FILE=$TOKEN_FILE
-Environment=EUROKVM_STATE=$STATE_FILE
-Environment=EUROKVM_DEVICE_NAME=$DEVICE_NAME
-Environment=EUROKVM_DEVICE_TAGS=$DEVICE_TAGS
-Environment=EUROKVM_KVMD_URL=$KVMD_URL
-Environment=EUROKVM_CONSOLE_ADDR=off
+Environment=KVMFLEET_API=$PLATFORM_URL
+Environment=KVMFLEET_TOKEN_FILE=$TOKEN_FILE
+Environment=KVMFLEET_STATE=$STATE_FILE
+Environment=KVMFLEET_DEVICE_NAME=$DEVICE_NAME
+Environment=KVMFLEET_DEVICE_TAGS=$DEVICE_TAGS
+Environment=KVMFLEET_KVMD_URL=$KVMD_URL
+Environment=KVMFLEET_CONSOLE_ADDR=off
+EnvironmentFile=-$KVMD_ENV_FILE
 
 [Install]
 WantedBy=multi-user.target
 UNIT
         systemctl daemon-reload
-        systemctl enable eurokvm-agent
-        systemctl start eurokvm-agent
-        echo "Service installed: systemctl status eurokvm-agent"
+        systemctl enable kvmfleet-agent
+        systemctl start kvmfleet-agent
+        echo "Service installed: systemctl status kvmfleet-agent"
         ;;
 
     busybox)
@@ -212,24 +254,25 @@ UNIT
         cat > "$INIT_SCRIPT" <<INITSCRIPT
 #!/bin/sh
 # KVM Fleet agent init script for BusyBox
-PIDFILE="/var/run/eurokvm-agent.pid"
+PIDFILE="/var/run/kvmfleet-agent.pid"
 AGENT="$AGENT_BIN"
 
-export EUROKVM_API="$PLATFORM_URL"
-export EUROKVM_TOKEN_FILE="$TOKEN_FILE"
-export EUROKVM_STATE="$STATE_FILE"
-export EUROKVM_DEVICE_NAME="$DEVICE_NAME"
-export EUROKVM_DEVICE_TAGS="$DEVICE_TAGS"
-export EUROKVM_KVMD_URL="$KVMD_URL"
-export EUROKVM_CONSOLE_ADDR="off"
+export KVMFLEET_API="$PLATFORM_URL"
+export KVMFLEET_TOKEN_FILE="$TOKEN_FILE"
+export KVMFLEET_STATE="$STATE_FILE"
+export KVMFLEET_DEVICE_NAME="$DEVICE_NAME"
+export KVMFLEET_DEVICE_TAGS="$DEVICE_TAGS"
+export KVMFLEET_KVMD_URL="$KVMD_URL"
+export KVMFLEET_CONSOLE_ADDR="off"
+[ -f "$KVMD_ENV_FILE" ] && . "$KVMD_ENV_FILE" && export KVMFLEET_KVMD_USER KVMFLEET_KVMD_PASS
 
 case "\$1" in
     start)
-        echo "Starting eurokvm-agent..."
+        echo "Starting kvmfleet-agent..."
         start-stop-daemon -S -b -m -p "\$PIDFILE" -x "\$AGENT" -- run
         ;;
     stop)
-        echo "Stopping eurokvm-agent..."
+        echo "Stopping kvmfleet-agent..."
         start-stop-daemon -K -p "\$PIDFILE" 2>/dev/null
         rm -f "\$PIDFILE"
         ;;
@@ -247,7 +290,7 @@ INITSCRIPT
         chmod +x "$INIT_SCRIPT"
 
         # Link into /etc/init.d/ for auto-start on boot
-        ln -sf "$INIT_SCRIPT" /etc/init.d/S99eurokvm 2>/dev/null || true
+        ln -sf "$INIT_SCRIPT" /etc/init.d/S99kvmfleet 2>/dev/null || true
 
         "$INIT_SCRIPT" start
         echo "Service installed: $INIT_SCRIPT {start|stop|restart}"
@@ -256,13 +299,13 @@ INITSCRIPT
     *)
         echo "WARNING: unknown init system. Starting agent in foreground."
         echo "You may want to set up a service manually."
-        EUROKVM_API="$PLATFORM_URL" \
-        EUROKVM_TOKEN_FILE="$TOKEN_FILE" \
-        EUROKVM_STATE="$STATE_FILE" \
-        EUROKVM_DEVICE_NAME="$DEVICE_NAME" \
-        EUROKVM_DEVICE_TAGS="$DEVICE_TAGS" \
-        EUROKVM_KVMD_URL="$KVMD_URL" \
-        EUROKVM_CONSOLE_ADDR="off" \
+        KVMFLEET_API="$PLATFORM_URL" \
+        KVMFLEET_TOKEN_FILE="$TOKEN_FILE" \
+        KVMFLEET_STATE="$STATE_FILE" \
+        KVMFLEET_DEVICE_NAME="$DEVICE_NAME" \
+        KVMFLEET_DEVICE_TAGS="$DEVICE_TAGS" \
+        KVMFLEET_KVMD_URL="$KVMD_URL" \
+        KVMFLEET_CONSOLE_ADDR="off" \
             "$AGENT_BIN" run &
         ;;
 esac
@@ -297,8 +340,8 @@ echo ""
 echo "Agent started but enrollment not confirmed yet."
 echo "Check logs:"
 case "$INIT_SYSTEM" in
-    systemd) echo "  journalctl -u eurokvm-agent -f" ;;
-    busybox) echo "  cat /var/log/messages | grep eurokvm" ;;
+    systemd) echo "  journalctl -u kvmfleet-agent -f" ;;
+    busybox) echo "  cat /var/log/messages | grep kvmfleet" ;;
 esac
 echo ""
 echo "If enrollment fails, verify:"
