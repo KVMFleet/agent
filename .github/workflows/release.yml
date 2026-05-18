@@ -1,0 +1,43 @@
+name: Release
+
+# Tag-driven release. Tagging `v0.3.0` builds the agent for every
+# supported arch, signs the checksum manifest via cosign keyless
+# (GitHub OIDC → Sigstore Fulcio), and attaches everything as a
+# GitHub release asset.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # for goreleaser to create the GitHub release
+  id-token: write   # for cosign keyless signing via OIDC
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # GoReleaser needs full history for the changelog
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      # Sigstore cosign — used by goreleaser's signs.cmd. Pinned to a
+      # known-good release rather than `latest` so a future cosign
+      # release can't silently change signature format on us.
+      - uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

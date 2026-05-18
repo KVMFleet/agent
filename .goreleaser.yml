@@ -1,0 +1,89 @@
+# GoReleaser config for the KVM Fleet agent.
+#
+# Triggered by the .github/workflows/release.yml GitHub Action on
+# tag pushes matching `v*`. Builds + cosign-keyless-signs the checksum
+# manifest, then attaches everything as a GitHub release asset.
+#
+# Cross-arch matrix matches the install.sh detection — linux arm/arm64
+# (PiKVM, JetKVM, Lenovo XCC ARM) + amd64 (everything else).
+#
+# Reproducibility: -trimpath + -buildvcs=false + a frozen build time
+# (mod_timestamp) make `go build` byte-identical for the same source.
+
+version: 2
+
+project_name: kvmfleet-agent
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: kvmfleet-agent
+    main: ./
+    binary: kvmfleet-agent
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .Commit }}
+    # Honour SOURCE_DATE_EPOCH (CI passes the tag's commit timestamp).
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "7"
+    ignore:
+      - goos: linux
+        goarch: arm
+        goarm: "6"
+
+archives:
+  - id: kvmfleet-agent
+    format: binary
+    name_template: kvmfleet-agent.{{ .Os }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# Cosign keyless: signs the checksums file with the GitHub OIDC token.
+# Verifiers check the cert's identity matches the workflow path + tag.
+#   cosign verify-blob \
+#     --certificate-identity-regexp '^https://github\.com/KVMFleet/agent/' \
+#     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+#     --certificate checksums.txt.pem --signature checksums.txt.sig \
+#     checksums.txt
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - "sign-blob"
+      - "--yes"
+      - "--oidc-issuer=https://token.actions.githubusercontent.com"
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+    artifacts: checksum
+    output: true
+
+release:
+  draft: false
+  github:
+    owner: KVMFleet
+    name: agent
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^ci:"
+      - "^chore:"
