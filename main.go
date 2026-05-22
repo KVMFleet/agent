@@ -325,7 +325,10 @@ func loadConfig() config {
 	tags := flag.String("tags", os.Getenv("KVMFLEET_DEVICE_TAGS"), "comma-separated tags")
 	hwKind := flag.String("hw-kind", envOr("KVMFLEET_HW_KIND", "pikvm-v4"), "hardware kind")
 	hwID := flag.String("hw-id", os.Getenv("KVMFLEET_HW_ID"), "stable hardware id (defaults to hostname)")
-	simulate := flag.Bool("simulate", true, "simulate metrics rather than read hardware")
+	// Production default is real-hardware mode. Pass `-simulate` (or set
+	// KVMFLEET_SIMULATE=1) only when developing against a non-PiKVM host
+	// where /sys/class/thermal/thermal_zone0/temp doesn't exist.
+	simulate := flag.Bool("simulate", envBool("KVMFLEET_SIMULATE", false), "simulate metrics rather than read hardware")
 	// Default to loopback-only so a stray default-config install doesn't
 	// expose kvmd to the LAN unauthenticated. Set KVMFLEET_CONSOLE_ADDR=off
 	// in production (recommended), or override to a specific address only
@@ -418,6 +421,17 @@ func consoleURL(cfg config) string {
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return d
+}
+
+func envBool(k string, d bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(k)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 	return d
 }
@@ -960,17 +974,25 @@ func sendWSClose(writes chan<- []byte, channelID string) {
 	}
 }
 
+// readTempC returns the device's CPU temperature in degrees Celsius.
+// In production (default), reads /sys/class/thermal/thermal_zone0/temp;
+// returns 0 (which the platform displays as "no reading") if the file
+// is missing or unreadable — DO NOT fall through to a plausible fake
+// number: a sysadmin reading "38.2°C" should be reading reality, not a
+// PRNG. `-simulate` flag is for local-dev only and explicitly returns
+// a synthetic value.
 func readTempC(cfg config) float64 {
-	if !cfg.Simulate {
-		// /sys/class/thermal/thermal_zone0/temp returns millidegrees C
-		if b, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp"); err == nil {
-			var v int
-			fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &v)
-			if v > 0 {
-				return float64(v) / 1000.0
-			}
-		}
+	if cfg.Simulate {
+		// Local-dev only — operator explicitly opted in.
+		return 38.0 + (rand.Float64()-0.5)*8.0
 	}
-	// simulate around 38°C ± 4
-	return 38.0 + (rand.Float64()-0.5)*8.0
+	b, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp")
+	if err != nil {
+		return 0
+	}
+	var v int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &v); err != nil || v <= 0 {
+		return 0
+	}
+	return float64(v) / 1000.0
 }
