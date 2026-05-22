@@ -248,6 +248,13 @@ func runAgent() {
 		log.Printf("resuming device_id=%s name=%s", st.DeviceID, st.Name)
 	}
 
+	// Phase B M2: ensure we have a per-device mTLS cert + key on disk.
+	// Fail-soft: if the issuance call errors, log and continue — the
+	// agent still uses the bearer-token path until M3 turns on mTLS
+	// verification. A key-gen failure does exit (no working CSPRNG
+	// is a hard stop).
+	ensureCert(cfg, st)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
