@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -198,6 +199,9 @@ type config struct {
 	KvmdURL     string // upstream kvmd (e.g. "https://127.0.0.1/"); empty = fake HTML
 	KvmdUser    string // kvmd Basic auth username (default: admin)
 	KvmdPass    string // kvmd Basic auth password (default: admin)
+	// Phase B M4: how often the agent calls the mTLS heartbeat
+	// endpoint as a self-test of the cert lifecycle. 0 disables.
+	MtlsHeartbeatInterval time.Duration
 }
 
 type state struct {
@@ -259,6 +263,14 @@ func runAgent() {
 	defer stop()
 
 	agentMuxOnce.Do(func() { agentMux = buildAgentMux(cfg, st) })
+
+	// Phase B M4: start the periodic mTLS heartbeat + cert-refresh
+	// loop. Heartbeats let prod operators see the mTLS layer working
+	// in real time (via agent.mtls.authed audit events); the 24h
+	// cert-refresh tick handles long-running agents whose cert
+	// approaches expiry mid-lifetime. Hooked to the same ctx as
+	// runLoop so a SIGTERM stops everything cleanly.
+	startMtlsLoop(ctx, cfg, st, cfg.MtlsHeartbeatInterval)
 
 	go startConsoleServer(ctx, cfg, st)
 	runLoop(ctx, cfg, st)
@@ -376,21 +388,40 @@ func loadConfig() config {
 		kurl = "https://127.0.0.1/"
 	}
 
+	// Phase B M4: mTLS heartbeat interval. KVMFLEET_MTLS_HEARTBEAT_SECONDS
+	// defaults to 60. Setting it to 0 disables the heartbeat loop
+	// entirely (the boot-time ensureCert still runs).
+	hbSeconds := envInt("KVMFLEET_MTLS_HEARTBEAT_SECONDS", 60)
+	mtlsInterval := time.Duration(hbSeconds) * time.Second
+
 	return config{
-		APIBase:     strings.TrimRight(*api, "/"),
-		StatePath:   *statePath,
-		TokenFile:   *tokenFile,
-		Name:        *name,
-		Tags:        tagList,
-		HWKind:      *hwKind,
-		HWID:        id,
-		Simulate:    *simulate,
-		ConsoleAddr: *consoleAddr,
-		ConsoleHost: host,
-		KvmdURL:     kurl,
-		KvmdUser:    *kvmdUser,
-		KvmdPass:    kvmdPass,
+		APIBase:               strings.TrimRight(*api, "/"),
+		StatePath:             *statePath,
+		TokenFile:             *tokenFile,
+		Name:                  *name,
+		Tags:                  tagList,
+		HWKind:                *hwKind,
+		HWID:                  id,
+		Simulate:              *simulate,
+		ConsoleAddr:           *consoleAddr,
+		ConsoleHost:           host,
+		KvmdURL:               kurl,
+		KvmdUser:              *kvmdUser,
+		KvmdPass:              kvmdPass,
+		MtlsHeartbeatInterval: mtlsInterval,
 	}
+}
+
+func envInt(k string, d int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return d
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return d
+	}
+	return n
 }
 
 // requireSafeKvmdPassword aborts startup if the operator left the kvmd
